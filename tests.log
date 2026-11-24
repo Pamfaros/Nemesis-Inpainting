@@ -1,0 +1,13 @@
+test_empty_and_full_masks (test_nemesis.TrainingTests.test_empty_and_full_masks) ... ok
+test_input_under_mask_cannot_leak (test_nemesis.TrainingTests.test_input_under_mask_cannot_leak) ... ok
+test_public_pair_import_and_duplicate_grouping (test_nemesis.TrainingTests.test_public_pair_import_and_duplicate_grouping) ... ok
+{"epoch": 1, "loss": 0.4209577441215515, "masked_mae": 0.25547397497928503, "masked_psnr_db": 10.545538283371974, "baseline_mae": 0.25797590775923296, "baseline_psnr_db": 10.478916603017831}
+Test {'masked_mae': 0.25547397497928503, 'masked_psnr_db': 10.545538283371974, 'baseline_mae': 0.25797590775923296, 'baseline_psnr_db': 10.478916603017831}
+{"epoch": 2, "loss": 0.4176575839519501, "masked_mae": 0.24702629320549244, "masked_psnr_db": 10.776216892704591, "baseline_mae": 0.25797590775923296, "baseline_psnr_db": 10.478916603017831}
+Test {'masked_mae': 0.24702629320549244, 'masked_psnr_db': 10.776216892704591, 'baseline_mae': 0.25797590775923296, 'baseline_psnr_db': 10.478916603017831}
+test_train_resume_and_lossless_png (test_nemesis.TrainingTests.test_train_resume_and_lossless_png) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 2.835s
+
+OK
