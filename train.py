@@ -10,7 +10,8 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from model import NemesisUNet, context_fill, objective
+from model.registry import build_model
+from model.model_hybrid import context_fill, objective
 
 
 def tensor(image):
@@ -87,10 +88,42 @@ def train(args):
     device = torch.device(args.device)
     if device.type=="cpu":
         torch.set_num_threads(min(4,torch.get_num_threads()))
-    model = NemesisUNet().to(device)
+    architecture = getattr(args, "architecture", "hybrid")
+
+    model_config = {
+        "architecture": architecture,
+        "width": getattr(args, "width", 24)
+    }
+
+    if architecture == "hybrid":
+
+        model_config.update({
+            "context_dim": getattr(args, "context_dim", 128),
+            "heads": getattr(args, "heads", 4),
+            "kv_size": getattr(args, "kv_size", 16),
+            "use_attention": not getattr(
+                args, "no_attention", False
+            ),
+            "use_ssm": getattr(args, "ssm", False)
+        })
+
+    model = build_model(model_config).to(device)
+
+    print("Architecture:", model_config)
+
+    print(
+        "Parameters:",
+        sum(p.numel() for p in model.parameters())
+    )
     optimizer = torch.optim.AdamW(model.parameters(),lr=args.lr)
     start, best, history = 0, float("inf"), []
-    settings = dict(digest=digest,seed=args.seed,batch=args.batch,lr=args.lr)
+    settings = dict(
+        digest=digest,
+        seed=args.seed,
+        batch=args.batch,
+        lr=args.lr,
+        model_config=model_config
+    )
     if args.resume:
         state = torch.load(latest,map_location="cpu",weights_only=True)
         if state["settings"] != settings:
@@ -119,9 +152,15 @@ def train(args):
         history.append(record)
         if score["masked_mae"] < best:
             best = score["masked_mae"]
-            atomic_save(dict(model=model.state_dict(),epoch=epoch),args.run/"best.pt")
-        atomic_save(dict(settings=settings,model=model.state_dict(),optimizer=optimizer.state_dict(),
-                         epoch=epoch,best=best,history=history),latest)
+            atomic_save(dict(model=model.state_dict(), 
+                             model_config=model_config, 
+                             epoch=epoch), args.run/"best.pt")
+        atomic_save(dict(settings=settings,
+                         model=model.state_dict(),
+                         model_config=model_config,
+                         optimizer=optimizer.state_dict(),
+                         epoch=epoch,best=best,history=history),
+                    latest)
         print(json.dumps(record),flush=True)
     state = torch.load(args.run/"best.pt",map_location=device,weights_only=True)
     model.load_state_dict(state["model"])
@@ -144,5 +183,14 @@ if __name__ == "__main__":
     p.add_argument("--lr",type=float,default=0.0005)
     p.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--resume",action="store_true")
+    p.add_argument("--architecture", 
+                   choices=["baseline", "hybrid"],
+                   default="hybrid")
+    p.add_argument("--width", type=int, default=24)
+    p.add_argument("--context-dim", type=int, default=128)
+    p.add_argument("--heads", type=int, default=4)
+    p.add_argument("--kv-size", type=int, default=16)
+    p.add_argument("--no-attention", action="store_true")
+    p.add_argument("--ssm", action="store_true")
     train(p.parse_args())
 

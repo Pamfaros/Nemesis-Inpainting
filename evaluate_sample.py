@@ -10,17 +10,17 @@ from PIL import Image, ImageDraw
 import torch
 
 from prepare import colored, draw_mask, fingerprint
-from model import NemesisUNet, context_fill
+from model.registry import load_model
+from model.model_hybrid import context_fill
 from train import tensor, evaluate
 
 
 @torch.inference_mode()
-def external(images, weights, out, device):
+def external(images, weights, out, device, side=160):
     if not images.is_dir():
         raise ValueError("Provide a directory of source JPEGs")
-    net = NemesisUNet().to(device).eval()
+    net = load_model(weights, device)
     net.load_state_dict(torch.load(weights,map_location=device,weights_only=True)["model"])
-    side = 160
     rows = []
     seen = set()
     examples = []
@@ -78,6 +78,7 @@ if __name__=="__main__":
     p.add_argument("weights",type=Path)
     p.add_argument("out",type=Path)
     p.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--size", type=int, default=160)
     a=p.parse_args()
     external(a.images,a.weights,a.out,a.device)
 

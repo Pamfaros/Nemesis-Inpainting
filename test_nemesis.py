@@ -11,7 +11,11 @@ import pyarrow.parquet as pq
 import torch
 from PIL import Image
 from inpaint import restore
-from model import NemesisUNet, context_fill, objective
+from model.model_hybrid import (
+    NemesisUNet,
+    context_fill,
+    objective
+)
 from prepare import hf_pairs
 from train import Patches, train
 
@@ -85,6 +89,87 @@ class TrainingTests(unittest.TestCase):
             with Image.open(root/"out.png") as out:
                 keep=np.array(mask)==0
                 np.testing.assert_array_equal(np.array(img)[keep],np.array(out)[keep])
+    
+    def test_hybrid_architectures(self):
+
+        for attention in (False, True):
+            for ssm in (False, True):
+
+                with self.subTest(
+                    attention=attention,
+                    ssm=ssm
+                ):
+
+                    net = NemesisUNet(
+                        width=8,
+                        context_dim=32,
+                        heads=4,
+                        kv_size=4,
+                        use_attention=attention,
+                        use_ssm=ssm
+                    )
+
+                    # Avoid trivial identity of the zero-init head
+                    with torch.no_grad():
+                        net.head.weight.normal_(0, 0.001)
+
+                    rgb = torch.rand(1, 3, 63, 79)
+
+                    for kind in ("empty", "partial", "full"):
+
+                        mask = torch.zeros(1, 1, 63, 79)
+
+                        if kind == "partial":
+                            mask[:, :, 15:40, 20:50] = 1
+
+                        elif kind == "full":
+                            mask.fill_(1)
+
+                        output = net(rgb, mask)
+
+                        self.assertEqual(
+                            output.shape, rgb.shape
+                        )
+
+                        self.assertTrue(
+                            torch.isfinite(output).all()
+                        )
+
+                        visible = ~mask.bool().expand_as(rgb)
+
+                        self.assertTrue(
+                            torch.equal(
+                                output[visible],
+                                rgb[visible]
+                            )
+                        )
+
+                        changed = torch.where(
+                            mask.bool(),
+                            torch.rand_like(rgb),
+                            rgb
+                        )
+
+                        second = net(changed, mask)
+
+                        self.assertTrue(
+                            torch.allclose(output, second)
+                        )
+
+                        net.zero_grad(set_to_none=True)
+
+                        loss = objective(output, rgb, mask)
+
+                        loss.backward()
+
+                        for parameter in net.parameters():
+                            if parameter.grad is not None:
+                                self.assertTrue(
+                                    torch.isfinite(
+                                        parameter.grad
+                                    ).all()
+                                )
+
 
 
 if __name__=="__main__":

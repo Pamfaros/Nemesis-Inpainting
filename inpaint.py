@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 from PIL import Image
 import torch
-from model import NemesisUNet
+from model.registry import load_model
 from train import tensor
 
 
@@ -13,7 +13,7 @@ def restore(weights, input_path, mask_path, output, device):
             raise ValueError("Image and mask must have the same dimensions")
         image = im.convert("RGB")
         mask = m.convert("L").point(lambda v: 255 if v >= 128 else 0)
-    net = NemesisUNet().to(device).eval()
+    net = load_model(weights, device)
     net.load_state_dict(torch.load(weights,map_location=device,weights_only=True)["model"])
     bounds = mask.getbbox()
     if bounds:
