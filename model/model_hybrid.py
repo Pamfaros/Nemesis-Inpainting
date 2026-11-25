@@ -242,6 +242,109 @@ class AxialStateSpace(nn.Module):
         x = self.out_proj(x)
         
         return residual + self.scale * x
+    
+
+class SelectiveAxialStateSpace(nn.Module):
+
+    def __init__(self, channels):
+        super().__init__()
+
+        self.norm = nn.GroupNorm(4, channels)
+
+        self.local = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=1,
+            groups=channels
+        )
+
+        self.value_proj = nn.Conv2d(
+            channels, channels, 1
+        )
+
+        self.gate_proj = nn.Conv2d(
+            channels, channels, 1
+        )
+
+        self.out_proj = nn.Conv2d(
+            channels, channels, 1
+        )
+
+        self.direction_weights = nn.Parameter(
+            torch.zeros(4, channels)
+        )
+
+        self.scale = nn.Parameter(
+            torch.tensor(0.1)
+        )
+
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, 2.0)
+
+    def scan(self, values, gates, dim, reverse=False):
+
+        values = values.unbind(dim=dim)
+        gates = gates.unbind(dim=dim)
+
+        if reverse:
+            values = values[::-1]
+            gates = gates[::-1]
+
+        state = torch.zeros_like(values[0])
+        outputs = []
+
+        for value, gate in zip(values, gates):
+
+            state = (
+                gate * state
+                + (1.0 - gate) * value
+            )
+
+            outputs.append(state)
+
+        if reverse:
+            outputs.reverse()
+
+        return torch.stack(outputs, dim=dim)
+
+    def forward(self, x):
+
+        residual = x
+
+        z = self.local(self.norm(x))
+
+        values = self.value_proj(z).float()
+
+        gates = torch.sigmoid(
+            self.gate_proj(z).float()
+        ).clamp(0.01, 0.99)
+
+        left = self.scan(values, gates, dim=3)
+
+        right = self.scan(
+            values, gates, dim=3, reverse=True
+        )
+
+        top = self.scan(values, gates, dim=2)
+
+        bottom = self.scan(
+            values, gates, dim=2, reverse=True
+        )
+
+        weights = self.direction_weights.softmax(dim=0)
+
+        directions = (left, right, top, bottom)
+
+        result = sum(
+            direction * weights[i].view(1, -1, 1, 1)
+            for i, direction in enumerate(directions)
+        )
+
+        result = self.out_proj(result.to(z.dtype))
+
+        return residual + self.scale * result
+
 
 class NemesisUNet(nn.Module):
     def __init__(self, width=24, 

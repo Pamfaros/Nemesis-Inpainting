@@ -10,22 +10,24 @@ from PIL import Image, ImageDraw
 import torch
 
 from prepare import colored, draw_mask, fingerprint
+from manhwa_masks import MASK_TYPES, draw_manhwa_mask
 from model.registry import load_model
 from model.model_hybrid import context_fill
 from train import tensor, evaluate
 
 
 @torch.inference_mode()
-def external(images, weights, out, device, side=160):
+def external(images, weights, out, device, side=160, *, hangul_font=None):
     if not images.is_dir():
-        raise ValueError("Provide a directory of source JPEGs")
+        raise ValueError("Provide a directory of source images")
     net = load_model(weights, device)
-    net.load_state_dict(torch.load(weights,map_location=device,weights_only=True)["model"])
     rows = []
     seen = set()
     examples = []
     audit = []
-    for path in sorted(images.glob("*.jpg")):
+    for path in sorted(images.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+            continue
         with Image.open(path) as im:
             page = im.convert("RGB")
         page_id = fingerprint(page)
@@ -35,16 +37,20 @@ def external(images, weights, out, device, side=160):
         rng = random.Random(page_id)
         count = 0
         for _ in range(100):
-            edge = min(min(page.size), rng.randint(side,3*side))
+            edge = side if hangul_font else min(min(page.size), rng.randint(side,3*side))
             x, y = rng.randint(0,page.width-edge),rng.randint(0,page.height-edge)
-            target = page.crop((x,y,x+edge,y+edge)).resize((side,side),Image.Resampling.LANCZOS)
+            target = page.crop((x,y,x+edge,y+edge))
+            if edge != side:
+                target = target.resize((side,side),Image.Resampling.LANCZOS)
             if not colored(target) or np.asarray(target).std(axis=(0,1)).mean()<12:
                 continue
-            mask = tensor(draw_mask(side,rng))
+            kind = MASK_TYPES[count] if hangul_font else None
+            generated = draw_manhwa_mask(side, rng, hangul_font, kind) if kind else draw_mask(side, rng)
+            mask = tensor(generated)
             clean = tensor(target)
             rgb = clean * (1-mask)
             rows.append((rgb,mask,clean))
-            audit.append(dict(source=path.name,sha256=page_id,box=[x,y,x+edge,y+edge]))
+            audit.append(dict(source=path.name,sha256=page_id,box=[x,y,x+edge,y+edge],mask_type=kind))
             if count==0 and len(examples)<4:
                 def to_image(a):
                     return Image.fromarray((a.clamp(0,1)*255).round().byte().cpu().permute(1,2,0).numpy())
@@ -79,6 +85,11 @@ if __name__=="__main__":
     p.add_argument("out",type=Path)
     p.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--size", type=int, default=160)
+    p.add_argument("--hangul-font", type=Path, help="Use native-scale patches and Hangul masks")
     a=p.parse_args()
-    external(a.images,a.weights,a.out,a.device)
+    external(
+        a.images, a.weights,
+        a.out, a.device,
+        side=a.size, hangul_font=a.hangul_font
+    )
 

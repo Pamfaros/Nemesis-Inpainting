@@ -1,36 +1,34 @@
+"""Restore masked regions on a native-resolution RGB page."""
 import argparse
 from pathlib import Path
 from PIL import Image
 import torch
 from model.registry import load_model
+from page import add_tile_options, restore_page
 from train import tensor
 
 
 @torch.inference_mode()
-def restore(weights, input_path, mask_path, output, device):
-    with Image.open(input_path) as im, Image.open(mask_path) as m:
-        if im.size != m.size:
-            raise ValueError("Image and mask must have the same dimensions")
-        image = im.convert("RGB")
-        mask = m.convert("L").point(lambda v: 255 if v >= 128 else 0)
+def restore(weights, input_path, mask_path, output, device, *, tile_size=256, overlap=None):
     net = load_model(weights, device)
-    net.load_state_dict(torch.load(weights,map_location=device,weights_only=True)["model"])
-    bounds = mask.getbbox()
-    if bounds:
-        l,t,r,b = bounds
-        box = (max(0,l-96),max(0,t-96),min(image.width,r+96),min(image.height,b+96))
-        rgb = tensor(image.crop(box))[None].to(device)
-        area = tensor(mask.crop(box))[None].to(device)
-        pred = net(rgb,area)[0].permute(1,2,0).mul(255).round().byte().cpu().numpy()
-        image.paste(Image.fromarray(pred),box,mask.crop(box))
-    image.save(output,format="PNG")
+
+    def predict(crop, holes):
+        rgb = tensor(crop)[None].to(device)
+        area = tensor(holes)[None].to(device)
+        return net(rgb, area)[0].permute(1, 2, 0).cpu().numpy()
+
+    with Image.open(input_path) as image, Image.open(mask_path) as mask:
+        result = restore_page(image, mask, predict, tile_size=tile_size, overlap=overlap)
+    result.save(output, format="PNG")
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description=__doc__)
     for arg in ("weights","image","mask","output"):
         p.add_argument(arg,type=Path)
     p.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
+    add_tile_options(p)
     args=p.parse_args()
-    restore(args.weights,args.image,args.mask,args.output,args.device)
+    restore(args.weights, args.image, args.mask, args.output, args.device,
+            tile_size=args.tile_size, overlap=args.overlap)
 

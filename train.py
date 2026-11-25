@@ -10,7 +10,8 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from model.registry import build_model
+from model.registry import build_model, checkpoint_config, initialize_model
+from model.model_baseline import manhwa_objective
 from model.model_hybrid import context_fill, objective
 
 
@@ -38,7 +39,11 @@ class Patches(Dataset):
                 return tensor(im.convert(mode))
         target = read("", "RGB")
         mask = (read("-mask","L") >= 0.5).float()
+        if target[:1].shape != mask.shape or not mask.any():
+            raise ValueError(f"Unaligned or empty mask for {row['stem']}")
         image = read("-input","RGB") if row["paired"] else target * (1-mask)
+        if image.shape != target.shape:
+            raise ValueError(f"Unaligned RGB pair for {row['stem']}")
         return image, mask, target
 
 
@@ -72,6 +77,9 @@ def atomic_save(obj, path):
 def train(args):
     if min(args.epochs,args.batch) < 1 or args.lr <= 0:
         raise ValueError("Use positive epochs, batch size and learning rate")
+    init_from = getattr(args, "init_from", None)
+    if args.resume and init_from is not None:
+        raise ValueError("--init-from starts a new run and cannot be combined with --resume")
     args.run.mkdir(parents=True,exist_ok=True)
     latest = args.run/"last.pt"
     if not args.resume and any(args.run.iterdir()):
@@ -79,10 +87,13 @@ def train(args):
     manifest = (args.data/"manifest.json").read_bytes()
     digest = hashlib.sha256(manifest).hexdigest()
     rows = json.loads(manifest)
-    groups = {}
+    groups, series = {}, {}
     for r in rows:
         if groups.setdefault(r["group"],r["split"]) != r["split"]:
             raise ValueError("Page crosses dataset splits")
+        name = r.get("series")
+        if name and series.setdefault(name, r["split"]) != r["split"]:
+            raise ValueError("Series crosses dataset splits: " + name)
     train_set, val_set, test_set = [Patches(args.data,split,rows) for split in ("train","val","test")]
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -107,7 +118,14 @@ def train(args):
             "use_ssm": getattr(args, "ssm", False)
         })
 
-    model = build_model(model_config).to(device)
+    model = build_model(model_config)
+    if init_from is not None:
+        with init_from.open("rb") as stream:
+            initial_digest = hashlib.sha256(stream.read()).hexdigest()
+            stream.seek(0)
+            initialize_model(model, model_config, torch.load(stream, map_location="cpu", weights_only=True))
+    model = model.to(device)
+    loss_fn = manhwa_objective if architecture == "manhwa" else objective
 
     print("Architecture:", model_config)
 
@@ -126,11 +144,17 @@ def train(args):
     )
     if args.resume:
         state = torch.load(latest,map_location="cpu",weights_only=True)
-        if state["settings"] != settings:
-            raise ValueError("Resume with the original dataset, seed, LR and batch size")
+        previous = dict(state["settings"])
+        previous.setdefault("model_config", checkpoint_config(state))
+        if "init_sha256" in previous:
+            settings["init_sha256"] = previous["init_sha256"]
+        if previous != settings:
+            raise ValueError("Resume with the original dataset, architecture, seed, LR and batch size")
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         start, best, history = state["epoch"], state["best"], state["history"]
+    elif init_from is not None:
+        settings["init_sha256"] = initial_digest
     val = DataLoader(val_set,batch_size=args.batch)
     for epoch in range(start+1,args.epochs+1):
         gen = torch.Generator().manual_seed(args.seed+epoch)
@@ -140,7 +164,7 @@ def train(args):
         for rgb, mask, target in batches:
             rgb, mask, target = (v.to(device) for v in (rgb,mask,target))
             optimizer.zero_grad(set_to_none=True)
-            loss = objective(model(rgb,mask),target,mask)
+            loss = loss_fn(model(rgb,mask),target,mask)
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite training loss")
             loss.backward()
@@ -183,8 +207,9 @@ if __name__ == "__main__":
     p.add_argument("--lr",type=float,default=0.0005)
     p.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--resume",action="store_true")
+    p.add_argument("--init-from", type=Path, help="Initialize a new run from an existing checkpoint")
     p.add_argument("--architecture", 
-                   choices=["baseline", "hybrid"],
+                   choices=["baseline", "hybrid", "manhwa"],
                    default="hybrid")
     p.add_argument("--width", type=int, default=24)
     p.add_argument("--context-dim", type=int, default=128)

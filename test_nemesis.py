@@ -16,7 +16,10 @@ from model.model_hybrid import (
     context_fill,
     objective
 )
-from prepare import hf_pairs
+from model.model_baseline import manhwa_objective
+from model.registry import build_model, initialize_model
+from page import restore_page
+from prepare import hf_pairs, paired_pages
 from train import Patches, train
 
 
@@ -42,6 +45,96 @@ class TrainingTests(unittest.TestCase):
         empty = torch.zeros_like(rgb[:,:1])
         self.assertTrue(torch.equal(context_fill(rgb,empty),rgb))
         self.assertTrue(torch.allclose(context_fill(rgb,empty+1),torch.full_like(rgb,0.5)))
+
+    def test_manhwa_transfer_and_masked_contours(self):
+        base_config = {"architecture": "baseline", "width": 8}
+        manhwa_config = {**base_config, "architecture": "manhwa"}
+        baseline, manhwa = build_model(base_config), build_model(manhwa_config)
+        with torch.no_grad():
+            baseline.head.weight.normal_(0, 0.01)
+        initialize_model(manhwa, manhwa_config, {"model_config": base_config, "model": baseline.state_dict()})
+        rgb = torch.rand(1, 3, 33, 37)
+        mask = torch.zeros_like(rgb[:, :1], dtype=torch.bool)
+        mask[..., 9:24, 3:25] = True
+        prediction = manhwa(rgb, mask)
+        torch.testing.assert_close(prediction, baseline(rgb, mask))
+        loss = manhwa_objective(prediction, rgb, mask)
+        loss.backward()
+        contour_grad = manhwa.entry[0].weight.grad[:, 7:]
+        self.assertTrue(contour_grad.isfinite().all())
+        self.assertGreater(contour_grad.abs().sum(), 0)
+        with torch.no_grad():
+            manhwa.entry[0].weight[:, 7:].normal_(0, 0.01)
+            dirty = torch.where(mask, 1 - rgb, rgb)
+            self.assertTrue(torch.equal(manhwa(dirty, mask), manhwa(rgb, mask)))
+
+    def test_page_tiles_cover_long_and_disconnected_masks(self):
+        pixels = np.random.default_rng(12).integers(0, 256, (671, 143, 3), dtype=np.uint8)
+        area = np.zeros(pixels.shape[:2], dtype=np.uint8)
+        area[24:490, 61:104] = 255
+        area[-5:, :10] = 128
+        area[0, -1] = 255
+        area[2, 1] = 127
+        tiles = []
+
+        def predict(crop, mask):
+            self.assertIsNotNone(mask.getbbox())
+            tiles.append(crop.size)
+            return np.full((crop.height, crop.width, 3), .75, dtype=np.float32)
+
+        image = Image.fromarray(pixels)
+        pred = np.asarray(restore_page(image, Image.fromarray(area), predict, tile_size=64))
+        self.assertGreater(len(tiles), 3)
+        self.assertTrue(all(max(size) <= 64 for size in tiles))
+        np.testing.assert_array_equal(pred[area < 128], pixels[area < 128])
+        self.assertTrue(np.all(pred[area >= 128] == 191))
+        with self.assertRaisesRegex(ValueError, "same dimensions"):
+            restore_page(image, Image.new("L", (1, 1)), predict)
+
+    def test_page_tiles_blend_overlapping_predictions(self):
+        image = Image.new("RGB", (45, 32))
+        mask = Image.new("L", image.size, 255)
+        colors = iter((0.0, 1.0))
+
+        def predict(crop, holes):
+            return np.full((crop.height, crop.width, 3), next(colors), dtype=np.float32)
+
+        row = np.asarray(restore_page(image, mask, predict, tile_size=32))[10, :, 0]
+        self.assertEqual((row[0], row[-1]), (0, 255))
+        self.assertTrue(0 < row[22] < 255)
+        self.assertTrue(np.all(row[1:] >= row[:-1]))
+
+    def test_prepare_aligned_pages_at_native_scale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pixels = np.random.default_rng(3).integers(0, 256, (105, 19, 3), dtype=np.uint8)
+            target = Image.fromarray(pixels)
+            dirty = target.copy()
+            dirty.paste("white", (3, 3, 16, 89))
+            mask = Image.new("L", target.size)
+            mask.paste(255, (3, 3, 16, 89))
+            for image, name in ((target, "target"), (dirty, "input"), (mask, "mask")):
+                image.save(root / (name + ".png"))
+            manifest = root / "pairs.jsonl"
+            row = dict(series="work", split="train", group="sfx", input="input.png", target="target.png", mask="mask.png")
+            manifest.write_text(json.dumps(row), encoding="utf-8")
+            out = root / "out"
+            out.mkdir()
+            args = SimpleNamespace(manifest=manifest, size=32)
+            rows = paired_pages(out, args)
+            self.assertGreater(len(rows), 1)
+            dataset = Patches(out, "train", rows)
+            for (_, holes, patch), record in zip(dataset, rows):
+                self.assertEqual(record["series"], "work")
+                self.assertEqual(record["mask_type"], "sfx")
+                self.assertEqual(tuple(patch.shape), (3, 32, 32))
+                self.assertFalse(holes[..., 19:].any())
+                left, top, right, bottom = record["box"]
+                restored = (patch[:, :, :19] * 255).round().byte().permute(1, 2, 0).numpy()
+                np.testing.assert_array_equal(restored, pixels[top:bottom, left:right])
+            manifest.write_text(json.dumps(row) + "\n" + json.dumps({**row, "split": "test"}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Series appears in multiple splits"):
+                paired_pages(out, args)
 
     def test_public_pair_import_and_duplicate_grouping(self):
         def encode(image):
